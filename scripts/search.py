@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-Semantic search over indexed markdown chunks.
-Pure Python stdlib — no external dependencies.
+Semantic memory search — query the chunk index with natural language.
 """
-
+from __future__ import annotations
 import argparse
 import json
 import math
@@ -11,156 +10,137 @@ import os
 import sqlite3
 import struct
 import sys
-import urllib.request
-import urllib.error
+from pathlib import Path
 
-DEFAULT_MODEL = "text-embedding-3-small"
-DEFAULT_BASE_URL = "https://api.openai.com/v1"
-DEFAULT_DB = os.path.join(os.path.dirname(__file__), "..", "memory.sqlite")
-DEFAULT_TOP_K = 5
-DEFAULT_MIN_SCORE = 0.3
+SCRIPT_DIR = Path(__file__).parent
+SKILL_DIR = SCRIPT_DIR.parent
 
 
-def unpack_vector(blob):
-    """Unpack binary blob to float list."""
+def load_config(config_path: str | None) -> dict:
+    if config_path:
+        p = Path(config_path)
+    else:
+        p = SKILL_DIR / "config.json"
+    with open(p) as f:
+        return json.load(f)
+
+
+def init_db(db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    return conn
+
+
+def blob_to_vector(blob: bytes) -> list[float]:
     n = len(blob) // 4
-    return struct.unpack(f"{n}f", blob)
+    return list(struct.unpack(f"{n}f", blob))
 
 
-def cosine_similarity(a, b):
-    """Compute cosine similarity between two vectors."""
+def cosine_similarity(a: list[float], b: list[float]) -> float:
     dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(x * x for x in b))
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
-
-
-def get_embedding(text, api_base, api_key, model):
-    """Get embedding for a single text."""
-    url = f"{api_base.rstrip('/')}/embeddings"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
-    payload = json.dumps({"input": [text], "model": model}).encode()
-    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")
-        print(f"Embedding API error {e.code}: {body}", file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-        print(f"Embedding request failed: {e}", file=sys.stderr)
-        sys.exit(1)
-    return data["data"][0]["embedding"]
-
-
-def search(query_vec, conn, top_k, min_score):
-    """Search indexed chunks by cosine similarity."""
-    rows = conn.execute(
-        """SELECT file_path, line_start, line_end, content, embedding
-           FROM chunks WHERE embedding IS NOT NULL"""
-    ).fetchall()
-
-    results = []
-    for file_path, line_start, line_end, content, emb_blob in rows:
-        vec = unpack_vector(emb_blob)
-        score = cosine_similarity(query_vec, vec)
-        if score >= min_score:
-            results.append({
-                "file": file_path,
-                "lines": f"{line_start}-{line_end}",
-                "score": round(score, 4),
-                "snippet": content[:700],
-            })
-
-    results.sort(key=lambda x: x["score"], reverse=True)
-    return results[:top_k]
+    return max(0.0, dot)  # clip negative due to L2 rounding
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Semantic search over indexed markdown"
-    )
+    parser = argparse.ArgumentParser(description="Search semantic memory")
+    parser.add_argument("query", help="Search query (natural language)")
+    parser.add_argument("--workspace", help="Workspace path (overrides config)")
+    parser.add_argument("--db", help="Database path (overrides config)")
+    parser.add_argument("--provider", help="Provider name (overrides config)")
+    parser.add_argument("--top-k", type=int, default=5, help="Number of results (default: 5)")
     parser.add_argument(
-        "query",
-        help="Search query text"
+        "--min-score", type=float, default=0.3, help="Minimum similarity score (default: 0.3)"
     )
+    parser.add_argument("--json", action="store_true", help="Output JSON format")
     parser.add_argument(
-        "--db",
-        default=os.environ.get("SEMANTIC_DB", DEFAULT_DB)
-    )
-    parser.add_argument(
-        "--api-base",
-        default=os.environ.get("EMBEDDING_API_BASE", DEFAULT_BASE_URL)
-    )
-    parser.add_argument(
-        "--api-key",
-        default=os.environ.get("EMBEDDING_API_KEY", "")
-    )
-    parser.add_argument(
-        "--model",
-        default=os.environ.get("EMBEDDING_MODEL", DEFAULT_MODEL)
-    )
-    parser.add_argument(
-        "--top-k",
-        type=int,
-        default=int(os.environ.get("SEMANTIC_TOP_K", DEFAULT_TOP_K))
-    )
-    parser.add_argument(
-        "--min-score",
-        type=float,
-        default=float(os.environ.get("SEMANTIC_MIN_SCORE", DEFAULT_MIN_SCORE))
-    )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        dest="json_output",
-        help="Output as JSON"
+        "--config", help="Config file path (default: skill dir config.json)"
     )
     args = parser.parse_args()
 
-    if not args.api_key:
-        print("Error: No API key. Set EMBEDDING_API_KEY or --api-key", file=sys.stderr)
-        sys.exit(1)
+    config = load_config(args.config)
+    indexing_cfg = config["indexing"]
 
-    db_path = os.path.abspath(os.path.expanduser(args.db))
+    workspace = os.path.expanduser(args.workspace or indexing_cfg["workspace"])
+    db_path = os.path.expanduser(args.db or indexing_cfg["db_path"])
+    provider_name = args.provider or config["provider"]
+
+    if not os.path.isabs(db_path):
+        db_path = os.path.join(workspace, db_path)
+
     if not os.path.exists(db_path):
-        print(f"Error: Database not found at {db_path}. Run index.py first.", file=sys.stderr)
+        print(f"Error: database not found at {db_path}")
+        print("Run 'python scripts/index.py' first to build the index.")
         sys.exit(1)
 
-    conn = sqlite3.connect(db_path)
-    total = conn.execute(
-        "SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL"
-    ).fetchone()[0]
-    if total == 0:
-        print("Error: No indexed chunks. Run index.py first.", file=sys.stderr)
-        conn.close()
-        sys.exit(1)
+    conn = init_db(db_path)
 
-    print(f"Searching {total} indexed chunks...", file=sys.stderr)
+    sys.path.insert(0, str(SCRIPT_DIR))
+    from init import get_provider
+
+    provider = get_provider(provider_name, config)
 
     # Embed query
-    query_vec = get_embedding(args.query, args.api_base, args.api_key, args.model)
+    try:
+        query_embedding = provider.embed([args.query])[0]
+    except Exception as e:
+        print(f"Error: failed to embed query: {e}")
+        sys.exit(1)
 
-    # Search
-    results = search(query_vec, conn, args.top_k, args.min_score)
-    conn.close()
-
-    if args.json_output:
-        print(json.dumps(results, ensure_ascii=False, indent=2))
+    # L2 normalize (provider may or may not return normalized vectors)
+    norm = math.sqrt(sum(x * x for x in query_embedding))
+    if norm == 0:
+        query_embedding = query_embedding
     else:
-        if not results:
-            print("No results found.")
-            return
-        for i, r in enumerate(results, 1):
-            print(f"\n--- Result {i} (score: {r['score']}) ---")
-            print(f"File: {r['file']} (lines {r['lines']})")
-            print(r["snippet"])
+        query_embedding = [x / norm for x in query_embedding]
+
+    # Load all chunks
+    rows = conn.execute(
+        "SELECT id, file_path, line_start, line_end, content, embedding FROM chunks"
+    ).fetchall()
+
+    if not rows:
+        print("Index is empty. Run 'python scripts/index.py' first.")
+        sys.exit(1)
+
+    # Score each chunk
+    scored = []
+    for row in rows:
+        chunk_id, fpath, line_start, line_end, content, blob = row
+        vec = blob_to_vector(blob)
+        score = cosine_similarity(query_embedding, vec)
+        if score >= args.min_score:
+            scored.append((score, fpath, line_start, line_end, content))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = scored[: args.top_k]
+
+    if not top:
+        print("No results above minimum score threshold.")
+        return
+
+    if args.json:
+        import json as jsonlib
+
+        results = [
+            {
+                "score": round(s, 4),
+                "file": fp,
+                "line_start": ls,
+                "line_end": le,
+                "content": content,
+            }
+            for s, fp, ls, le, content in top
+        ]
+        print(jsonlib.dumps(results, ensure_ascii=False, indent=2))
+    else:
+        for rank, (score, fpath, line_start, line_end, content) in enumerate(top, 1):
+            rel = os.path.relpath(fpath, workspace)
+            snippet = content[:200].replace("\n", " ").strip()
+            print(f"--- Result {rank} (score={score:.4f}) ---")
+            print(f"File: {rel}  lines {line_start}-{line_end}")
+            print(f"     {snippet}")
+            print()
+
+    conn.close()
 
 
 if __name__ == "__main__":

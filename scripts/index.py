@@ -1,273 +1,263 @@
 #!/usr/bin/env python3
 """
-Index markdown files in a workspace into SQLite with embeddings.
-Pure Python stdlib — no external dependencies.
+Semantic memory indexer — build / update chunk embeddings in SQLite.
 """
-
+from __future__ import annotations
 import argparse
-import hashlib
 import json
 import math
 import os
-import re
+import hashlib
 import sqlite3
 import struct
 import sys
-import urllib.request
-import urllib.error
+from pathlib import Path
+from typing import List, Tuple
 
-# --- Config ---
-DEFAULT_MODEL = "text-embedding-3-small"
-DEFAULT_BASE_URL = "https://api.openai.com/v1"
-DEFAULT_DB = os.path.join(os.path.dirname(__file__), "..", "memory.sqlite")
-CHUNK_TARGET = 400  # target tokens (~chars * 0.75)
-CHUNK_OVERLAP = 80
-CHAR_PER_TOKEN = 4  # rough estimate
-
-CHUNK_TARGET_CHARS = CHUNK_TARGET * CHAR_PER_TOKEN
-CHUNK_OVERLAP_CHARS = CHUNK_OVERLAP * CHAR_PER_TOKEN
+# Resolve skill directory relative to this script
+SCRIPT_DIR = Path(__file__).parent
+SKILL_DIR = SCRIPT_DIR.parent
 
 
-def init_db(db_path):
-    """Create database schema if not exists."""
+def load_config(config_path: str | None) -> dict:
+    if config_path:
+        p = Path(config_path)
+    else:
+        p = SKILL_DIR / "config.json"
+    with open(p) as f:
+        return json.load(f)
+
+
+def init_db(db_path: str):
     conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("""
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS chunks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_path TEXT NOT NULL,
-            line_start INTEGER NOT NULL,
-            line_end INTEGER NOT NULL,
-            content TEXT NOT NULL,
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_path    TEXT NOT NULL,
+            line_start   INTEGER NOT NULL,
+            line_end     INTEGER NOT NULL,
+            content      TEXT NOT NULL,
             content_hash TEXT NOT NULL,
-            embedding BLOB,
+            embedding    BLOB NOT NULL,
             UNIQUE(file_path, line_start, content_hash)
         )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS meta (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
-    # Index for faster similarity search
+        """
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_file_path ON chunks(file_path)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_hash ON chunks(content_hash)")
     conn.commit()
     return conn
 
 
-def chunk_markdown(text, file_path):
-    """Split markdown into overlapping chunks, tracking line numbers."""
-    lines = text.split("\n")
-    chunks = []
-    i = 0
-    while i < len(lines):
-        chunk_lines = []
-        char_count = 0
-        start = i
-        while i < len(lines) and char_count < CHUNK_TARGET_CHARS:
-            chunk_lines.append(lines[i])
-            char_count += len(lines[i]) + 1
-            i += 1
-        content = "\n".join(chunk_lines).strip()
-        if content:
-            chunks.append({
-                "file_path": file_path,
-                "line_start": start + 1,
-                "line_end": start + len(chunk_lines),
-                "content": content,
-                "content_hash": hashlib.md5(content.encode()).hexdigest(),
-            })
-        # Overlap: rewind by overlap amount
+def get_existing_hashes(conn: sqlite3.Connection) -> set:
+    rows = conn.execute("SELECT file_path, line_start, content_hash FROM chunks")
+    return {(r[0], r[1], r[2]) for r in rows}
+
+
+def get_indexed_files(conn: sqlite3.Connection) -> set:
+    rows = conn.execute("SELECT DISTINCT file_path FROM chunks")
+    return {r[0] for r in rows}
+
+
+def chunk_text(
+    lines: list[str], chunk_size: int, chunk_overlap: int
+) -> list[tuple[int, int, str]]:
+    """
+    Sliding-window chunking over lines.
+    Returns list of (line_start, line_end, content) where line_start/end are 1-indexed.
+    """
+    result = []
+    n = len(lines)
+    if n == 0:
+        return result
+
+    start = 0
+    while start < n:
+        end = start + 1
+        char_count = len(lines[start])
+        while end < n and char_count < chunk_size:
+            char_count += len(lines[end])
+            end += 1
+
+        # clamp
+        chunk_lines = lines[start:end]
+        content = "".join(chunk_lines)
+
+        result.append((start + 1, end, content))
+
+        if end >= n:
+            break
+
+        # step back by overlap lines
         overlap_chars = 0
-        rewind = 0
-        for j in range(len(chunk_lines) - 1, -1, -1):
-            overlap_chars += len(chunk_lines[j]) + 1
-            rewind += 1
-            if overlap_chars >= CHUNK_OVERLAP_CHARS:
+        step_back = 0
+        for i in range(len(chunk_lines) - 1, 0, -1):
+            overlap_chars += len(chunk_lines[i])
+            step_back += 1
+            if overlap_chars >= chunk_overlap:
                 break
-        if rewind > 0 and i < len(lines):
-            i -= rewind
-    return chunks
+        start = max(start + 1, start + step_back)
+
+    return result
 
 
-def get_embeddings(texts, api_base, api_key, model, batch_size=10):
-    """Call OpenAI-compatible embedding API in batches."""
-    url = f"{api_base.rstrip('/')}/embeddings"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
-    all_embeddings = []
-    for start in range(0, len(texts), batch_size):
-        batch = texts[start:start + batch_size]
-        payload = json.dumps({"input": batch, "model": model}).encode()
-        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                data = json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            body = e.read().decode(errors="replace")
-            print(f"Embedding API error {e.code}: {body}", file=sys.stderr)
-            sys.exit(1)
-        except Exception as e:
-            print(f"Embedding request failed at batch {start}: {e}", file=sys.stderr)
-            sys.exit(1)
-        # Sort by index to ensure order
-        sorted_embs = sorted(data["data"], key=lambda x: x["index"])
-        all_embeddings.extend([e["embedding"] for e in sorted_embs])
-        done = start + len(batch)
-        print(f"  Embedded {done}/{len(texts)} chunks", flush=True)
-    return all_embeddings
+def content_hash(content: str) -> str:
+    return hashlib.md5(content.encode()).hexdigest()
 
 
-def pack_vector(vec):
-    """Pack float list to binary blob."""
+def vector_to_blob(vec: list[float]) -> bytes:
     return struct.pack(f"{len(vec)}f", *vec)
 
 
-def scan_markdown_files(workspace):
-    """Find all .md files recursively."""
+def blob_to_vector(blob: bytes) -> list[float]:
+    n = len(blob) // 4
+    return list(struct.unpack(f"{n}f", blob))
+
+
+def l2_normalize(vec: list[float]) -> list[float]:
+    norm = math.sqrt(sum(x * x for x in vec))
+    if norm == 0:
+        return vec
+    return [x / norm for x in vec]
+
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    return dot  # both already L2-normalized
+
+
+def walk_markdown(workspace: str, exclude_dirs: list[str]) -> list[str]:
+    workspace = os.path.expanduser(workspace)
+    exclude = set(exclude_dirs)
     md_files = []
     for root, dirs, files in os.walk(workspace):
-        # Skip hidden dirs and common exclusions
-        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in (
-            "node_modules", "__pycache__", ".git", "venv", ".venv"
-        )]
-        for f in files:
-            if f.endswith(".md"):
-                md_files.append(os.path.join(root, f))
-    return sorted(md_files)
+        # Prune excluded dirs in-place so os.walk doesn't descend
+        dirs[:] = [d for d in dirs if d not in exclude]
+        for fname in files:
+            if fname.endswith(".md"):
+                md_files.append(os.path.join(root, fname))
+    return md_files
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Index markdown files for semantic search"
-    )
+    parser = argparse.ArgumentParser(description="Build / update semantic index")
+    parser.add_argument("--workspace", help="Workspace path (overrides config)")
+    parser.add_argument("--db", help="Database path (overrides config)")
+    parser.add_argument("--provider", help="Provider name (overrides config)")
+    parser.add_argument("--reindex", action="store_true", help="Force full rebuild")
     parser.add_argument(
-        "workspace",
-        nargs="?",
-        default=os.environ.get("WORKSPACE", "."),
-        help="Workspace directory to scan (default: cwd or $WORKSPACE)"
-    )
-    parser.add_argument(
-        "--db",
-        default=os.environ.get("SEMANTIC_DB", DEFAULT_DB),
-        help="SQLite database path"
-    )
-    parser.add_argument(
-        "--api-base",
-        default=os.environ.get("EMBEDDING_API_BASE", DEFAULT_BASE_URL)
-    )
-    parser.add_argument(
-        "--api-key",
-        default=os.environ.get("EMBEDDING_API_KEY", "")
-    )
-    parser.add_argument(
-        "--model",
-        default=os.environ.get("EMBEDDING_MODEL", DEFAULT_MODEL)
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Force full reindex (clear existing data)"
+        "--config", help="Config file path (default: skill dir config.json)"
     )
     args = parser.parse_args()
 
-    if not args.api_key:
-        print("Error: No API key. Set EMBEDDING_API_KEY or --api-key", file=sys.stderr)
+    config = load_config(args.config)
+    indexing_cfg = config["indexing"]
+
+    workspace = os.path.expanduser(args.workspace or indexing_cfg["workspace"])
+    db_path = os.path.expanduser(args.db or indexing_cfg["db_path"])
+    provider_name = args.provider or config["provider"]
+    chunk_size = indexing_cfg["chunk_size"]
+    chunk_overlap = indexing_cfg["chunk_overlap"]
+    exclude_dirs = indexing_cfg["exclude_dirs"]
+
+    if not os.path.isdir(workspace):
+        print(f"Error: workspace not found: {workspace}")
         sys.exit(1)
 
-    # Resolve paths
-    workspace = os.path.abspath(args.workspace)
-    db_path = os.path.abspath(os.path.expanduser(args.db))
-
-    # Ensure db directory exists
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
-
-    print(f"Workspace: {workspace}")
-    print(f"Database:  {db_path}")
-    print(f"Provider:  {args.api_base}")
-    print(f"Model:     {args.model}")
+    # Resolve db path relative to workspace for convenience
+    if not os.path.isabs(db_path):
+        db_path = os.path.join(workspace, db_path)
 
     conn = init_db(db_path)
 
-    if args.force:
+    if args.reindex:
         conn.execute("DELETE FROM chunks")
         conn.commit()
-        print("Cleared existing index (--force)")
+        print("Full rebuild triggered — all existing chunks deleted.")
 
-    # Scan files
-    md_files = scan_markdown_files(workspace)
-    print(f"Found {len(md_files)} markdown files")
+    # Add scripts directory to path for get_provider
+    sys.path.insert(0, str(SCRIPT_DIR))
+    from init import get_provider
 
-    if not md_files:
-        print("No markdown files found.")
-        conn.close()
-        return
+    provider = get_provider(provider_name, config)
 
-    # Chunk all files
-    all_chunks = []
-    for fpath in md_files:
-        rel_path = os.path.relpath(fpath, workspace)
-        try:
-            with open(fpath, "r", encoding="utf-8", errors="replace") as f:
-                text = f.read()
-        except Exception as e:
-            print(f"  Skip {rel_path}: {e}")
-            continue
-        chunks = chunk_markdown(text, rel_path)
-        all_chunks.extend(chunks)
+    # --- Phase 1: discover all markdown files ---
+    md_files = walk_markdown(workspace, exclude_dirs)
+    current_files = set(md_files)
 
-    print(f"Total chunks: {len(all_chunks)}")
-
-    # Filter out already-indexed chunks (incremental update)
-    new_chunks = []
-    for c in all_chunks:
-        existing = conn.execute(
-            "SELECT id FROM chunks WHERE file_path=? AND line_start=? AND content_hash=?",
-            (c["file_path"], c["line_start"], c["content_hash"])
-        ).fetchone()
-        if not existing:
-            new_chunks.append(c)
-
-    # Remove stale chunks (files deleted or content changed)
-    indexed_files = set(c["file_path"] for c in all_chunks)
-    db_files = set(r[0] for r in conn.execute(
-        "SELECT DISTINCT file_path FROM chunks"
-    ).fetchall())
-    stale_files = db_files - indexed_files
-    if stale_files:
-        for sf in stale_files:
-            conn.execute("DELETE FROM chunks WHERE file_path=?", (sf,))
+    # --- Phase 2: remove stale entries ---
+    indexed_files = get_indexed_files(conn)
+    stale = indexed_files - current_files
+    if stale:
+        for f in stale:
+            conn.execute("DELETE FROM chunks WHERE file_path = ?", (f,))
         conn.commit()
-        print(f"Removed {len(stale_files)} stale files from index")
+        print(f"Removed {len(stale)} stale file(s) from index.")
 
-    if not new_chunks:
-        print("Index is up to date. Nothing to embed.")
-        conn.close()
+    # --- Phase 3: collect chunks needing embedding ---
+    existing = get_existing_hashes(conn)
+    to_embed = []  # list of (file_path, line_start, line_end, content)
+
+    for fpath in md_files:
+        try:
+            with open(fpath) as f:
+                raw = f.read()
+        except PermissionError:
+            print(f"Warning: cannot read {fpath} — skipping")
+            continue
+        except Exception as e:
+            print(f"Warning: error reading {fpath}: {e} — skipping")
+            continue
+
+        if raw == "":
+            continue
+
+        lines = raw.splitlines(keepends=False)
+        chunks = chunk_text(lines, chunk_size, chunk_overlap)
+
+        for line_start, line_end, content in chunks:
+            h = content_hash(content)
+            key = (fpath, line_start, h)
+            if key not in existing:
+                to_embed.append((fpath, line_start, line_end, content))
+
+    if not to_embed:
+        print("Nothing to index — all chunks up to date.")
         return
 
-    print(f"New/changed chunks to embed: {len(new_chunks)}")
+    print(f"Indexing {len(to_embed)} new chunk(s)...")
 
-    # Get embeddings
-    texts = [c["content"] for c in new_chunks]
-    embeddings = get_embeddings(texts, args.api_base, args.api_key, args.model)
+    # --- Phase 4: batch embed and write ---
+    BATCH = 16
+    total = len(to_embed)
 
-    # Insert into database
-    for chunk, emb in zip(new_chunks, embeddings):
-        conn.execute(
-            """INSERT OR REPLACE INTO chunks
-               (file_path, line_start, line_end, content, content_hash, embedding)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (chunk["file_path"], chunk["line_start"], chunk["line_end"],
-             chunk["content"], chunk["content_hash"], pack_vector(emb))
-        )
-    conn.commit()
+    for i in range(0, total, BATCH):
+        batch = to_embed[i : i + BATCH]
+        texts = [item[3] for item in batch]
 
-    total = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-    print(f"Done. Total indexed chunks: {total}")
-    conn.close()
+        try:
+            embeddings = provider.embed(texts)
+        except Exception as e:
+            print(f"API error during batch {i//BATCH + 1}: {e}")
+            sys.exit(1)
+
+        for (fpath, line_start, line_end, content), emb in zip(batch, embeddings):
+            h = content_hash(content)
+            normalized = l2_normalize(emb)
+            blob = vector_to_blob(normalized)
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO chunks (file_path, line_start, line_end, content, content_hash, embedding) VALUES (?, ?, ?, ?, ?, ?)",
+                    (fpath, line_start, line_end, content, h, blob),
+                )
+            except Exception as e:
+                print(f"DB error inserting chunk from {fpath}: {e}")
+
+        conn.commit()
+        print(f"  Batch {i//BATCH + 1}/{(total + BATCH - 1)//BATCH} — {min(i+BATCH, total)}/{total} done")
+
+    print(f"Indexing complete. {total} chunk(s) added / updated.")
 
 
 if __name__ == "__main__":

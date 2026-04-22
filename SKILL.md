@@ -18,58 +18,82 @@ Semantic search over workspace markdown files using OpenAI-compatible Embedding 
 ## How It Works
 
 ```
-.md files → chunk (~400 tokens) → Embedding API → SQLite vector DB
-                                                    ↓
+.md files → sliding-window chunk (400 chars, 80 overlap) → Embedding API → SQLite vector DB
+                                                              ↓
 User query → Embedding API → query vector → cosine similarity → Top-K results
 ```
 
-- **Chunk strategy:** ~400 tokens/chunk, 80-token overlap between chunks
-- **Vector storage:** SQLite + binary blob (struct.pack float arrays)
-- **Similarity:** Cosine similarity
+- **Chunk strategy:** 400 chars/chunk, 80-char overlap, MD5 deduplication
+- **Vector storage:** SQLite BLOB (struct.pack float arrays), L2 normalized
+- **Similarity:** Cosine similarity (dot product after L2 norm)
 - **Incremental indexing:** MD5-based change detection, auto-cleanup of deleted files
-- **Batch embedding:** 10 chunks/batch to avoid API timeout
-- **Dependencies:** Pure Python stdlib + any OpenAI-compatible embedding API
+- **Batch embedding:** 16 chunks/batch
+- **Dependencies:** Pure Python stdlib only
 
 ## Setup
 
-Set environment variables (or pass as CLI args — CLI takes priority):
+Edit `~/.hermes/skills/semantic-memory/config.json`:
 
-```bash
-export EMBEDDING_API_KEY="your-api-key"
-export EMBEDDING_API_BASE="https://api.openai.com/v1"   # any OpenAI-compatible endpoint
-export EMBEDDING_MODEL="text-embedding-3-small"          # optional, default
+```json
+{
+  "provider": "spark",
+  "spark": {
+    "api_key": "your-spark-api-key",
+    "api_base": "https://maas-api.cn-huabei-1.xf-yun.com/v2",
+    "embedding_model": "sde0a5839",
+    "rerank_model": "s125c8e0e"
+  },
+  "openai": {
+    "api_key": "your-openai-api-key",
+    "api_base": "https://api.openai.com/v1",
+    "model": "text-embedding-3-small"
+  },
+  "indexing": {
+    "workspace": "~/.openclaw/workspace",
+    "db_path": "memory.sqlite",
+    "chunk_size": 400,
+    "chunk_overlap": 80,
+    "exclude_dirs": [".git", "node_modules", "__pycache__", ".venv", "venv", ".obsidian"]
+  }
+}
 ```
+
+> **讯飞 Spark MaaS v2 注意：** `api_key` 使用控制台获取的 APIKey 值（Bearer Token 认证）。`embedding_model` 和 `rerank_model` 是分别的模型 ID。切换 provider 只需改 `"provider": "openai"` 并填 `openai` 的字段。
+
+Switch provider by changing `"provider": "spark"` to `"provider": "openai"`.
 
 ## Index a Workspace
 
 ```bash
-python3 ~/.hermes/skills/semantic-memory/scripts/index.py /path/to/workspace
+python3 ~/.hermes/skills/semantic-memory/scripts/index.py
 ```
 
 Options:
-- `--force` — clear existing index and rebuild from scratch
-- `--db PATH` — custom SQLite path (default: `~/.hermes/skills/semantic-memory/memory.sqlite`)
-- `--api-base`, `--api-key`, `--model` — override env vars
+- `--workspace PATH` — override workspace path
+- `--db PATH` — override database path
+- `--provider NAME` — override provider (spark / openai)
+- `--reindex` — force full rebuild (delete all existing chunks first)
+- `--config PATH` — override config file path
 
-Incremental by default: only new/changed chunks are embedded. Deleted files are auto-cleaned.
+Incremental by default: only new/changed chunks are embedded. Deleted files are auto-cleaned from DB.
 
 ## Search
 
 ```bash
-python3 ~/.hermes/skills/semantic-memory/scripts/search.py "what was that decision about the database"
+python3 ~/.hermes/skills/semantic-memory/scripts/search.py "what was that decision about database"
 ```
 
 Options:
 - `--top-k N` — number of results (default: 5)
 - `--min-score F` — minimum cosine similarity threshold (default: 0.3)
 - `--json` — output as JSON for programmatic use
-- `--db`, `--api-base`, `--api-key`, `--model` — same as index
+- `--workspace`, `--db`, `--provider`, `--config` — same as index
 
 ## Agent Workflow
 
 ### Typical usage pattern:
 
-1. **First time:** Run `index.py` on the workspace (or relevant subdirectory)
+1. **First time:** Run `index.py` on the workspace
 2. **After changes:** Re-run `index.py` — incremental update handles additions/changes
 3. **To find something:** Run `search.py "conceptual query"`
 4. **Load full context:** Use results' file paths + line numbers with `read_file`
@@ -85,52 +109,70 @@ Options:
 | Search code by symbol/function name | `search_files` |
 | Find files by name | `search_files(target="files")` |
 
-## Configuration Reference
+## File Structure
 
-| Env Variable | CLI Flag | Default | Description |
-|-------------|----------|---------|-------------|
-| `EMBEDDING_API_KEY` | `--api-key` | (required) | API key for embedding service |
-| `EMBEDDING_API_BASE` | `--api-base` | `https://api.openai.com/v1` | API endpoint URL |
-| `EMBEDDING_MODEL` | `--model` | `text-embedding-3-small` | Embedding model name |
-| `SEMANTIC_DB` | `--db` | `~/.hermes/skills/semantic-memory/memory.sqlite` | SQLite database path |
-| `SEMANTIC_TOP_K` | `--top-k` | `5` | Default result count |
-| `SEMANTIC_MIN_SCORE` | `--min-score` | `0.3` | Minimum similarity threshold |
+```
+~/.hermes/skills/semantic-memory/
+├── SKILL.md                        # This file
+├── config.json                     # Global configuration
+└── scripts/
+    ├── init.py                     # get_provider() — runtime provider loader
+    ├── index.py                    # Build / update index
+    ├── search.py                   # Search the index
+    └── providers/
+        ├── __init__.py            # EmbeddingProvider base class
+        ├── openai.py              # OpenAI-compatible provider
+        └── spark.py               # Spark MaaS v2 provider (Bearer Token)
+```
 
 ## Compatible Embedding APIs
 
-Any service exposing an OpenAI-compatible `/v1/embeddings` endpoint:
+Any service exposing an OpenAI-compatible `/embeddings` endpoint:
 
+- Spark (讯飞星火) — `provider: "spark"`, embedding_model: `sde0a5839`, rerank_model: `s125c8e0e`
 - OpenAI (text-embedding-3-small / text-embedding-3-large)
 - Azure OpenAI
 - Gemini Embedding
 - Ollama (local: `http://localhost:11434`)
-- Fireworks AI
-- Groq
+- Fireworks AI / Groq
 - Any OpenAI-compatible proxy
 
 ## Tips
 
 - **Index size:** ~100-200 chunks per MB of markdown. A 10MB workspace ≈ 1500-2000 chunks.
 - **Speed:** Indexing is the slow part (API calls). Searching is fast (<1s for 10K chunks).
-- **Overlap helps:** The 80-token overlap ensures concepts at chunk boundaries aren't lost.
+- **Overlap helps:** The 80-char overlap ensures concepts at chunk boundaries aren't lost.
 - **min-score:** Lower = more results but lower quality. 0.3-0.5 is usually a good range.
 - **top-k:** More results give better coverage but more noise. 5-10 is usually enough.
-- **Batch size:** 10 chunks per API call — balances speed vs. timeout risk.
 
 ## Troubleshooting
 
-**"No API key" error:**
-```bash
-export EMBEDDING_API_KEY="sk-..."
-```
+**"API key for provider 'spark' is not set" error:**
+→ Set `api_key` in the `spark` section of `config.json`.
+
+**讯飞 Spark 401 认证错误：**
+讯飞 MaaS v2 使用 Bearer Token 认证（`Authorization: Bearer <key>`）。如果报 401，检查：1) `api_key` 是否正确；2) `api_base` 是否以 `/v2` 结尾；3) `embedding_model` 是否与控制台模型 ID 一致。
 
 **"Database not found" error:**
-Run `index.py` first to create the database.
+→ Run `index.py` first to create the database.
 
-**"No indexed chunks" error:**
-Either the database is empty or was cleared. Re-run `index.py`.
+**"Nothing to index — all chunks up to date" but index is empty:**
+→ The database might be at a different path. Use `--db PATH` to specify location.
+
+**Indexing interrupted (IncompleteRead / timeout):**
+→ Just re-run `index.py` without `--reindex`. Incremental mode skips already-indexed chunks and picks up where it left off. No need to start over.
 
 **Poor search results:**
 - Try lowering `--min-score` to 0.25 or 0.2
-- Try re-indexing with `--force` if the workspace changed significantly
+- Try re-indexing with `--reindex` if the workspace changed significantly
 - Consider whether your query describes a *concept* rather than specific words
+
+## Architecture Notes
+
+**Provider abstraction works as designed:** `index.py` and `search.py` contain zero provider logic. Switching from `spark` to `openai` was a one-line config change. Adding a new provider = adding one file in `providers/` + one `get_provider()` branch in `scripts/init.py` + updating `config.json`.
+
+**Pure stdlib confirmed:** All source files use only `json / urllib.request / sqlite3 / hashlib / struct / math / argparse / os`. No external dependencies needed.
+
+**Python 3.9 compatible:** All type annotations use `from __future__ import annotations` pattern where needed.
+
+**Incremental indexing verified:** The MD5-based change detection correctly skips unchanged chunks. Deleted files are auto-removed from DB on re-index.

@@ -1,0 +1,37 @@
+{
+  "provider": "spark",
+
+  "spark": {
+    "api_key": "c3fe6030f22c161361c6f15cb1655ff3:MGQ1ZTEzYWY0OGFlNzg4ZGIyYTFiNTRm",
+    "api_base": "https://maas-api.cn-huabei-1.xf-yun.com/v2",
+    "embedding_model": "xop3qwen8bembedding",
+    "rerank_model": "s125c8e0e"
+  },
+
+  "openai": {
+    "api_key": "",
+    "api_base": "https://api.openai.com/v1",
+    "model": "text-embedding-3-small"
+  },
+
+  "doubao": {
+    "api_key": "ark-8b7db3f2-9d2e-4e29-9472-6d4c3c1da8c1-72c56",
+    "api_base": "https://ark.cn-beijing.volces.com/api/coding/v3",
+    "model": "Doubao-Embedding-Vision"
+  },
+
+  "indexing": {
+    "workspace": "~/.openclaw/workspace",
+    "db_path": "memory.sqlite",
+    "chunk_size": 400,
+    "chunk_overlap": 80,
+    "exclude_dirs": [
+      ".git",
+      "node_modules",
+      "__pycache__",
+      ".venv",
+      "venv",
+      ".obsidian"
+    ]
+  }
+}
